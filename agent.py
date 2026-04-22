@@ -8,27 +8,30 @@ import subprocess
 import anthropic
 from anthropic.types import MessageParam
 from tools import TOOL_DEFINITIONS, execute_tool
-from prompts import build_system_prompt, build_initial_message
+from prompts import build_system_prompt, build_initial_message, PHASE_NAMES
 import time
+from inventory import run_inventory, inventory_to_prompt
 
-PHASE_NAMES = {
-    1: "inventory",
-    2: "package_updates", 
-    3: "startup_modernization",
-    4: "source_updates",
-    5: "tests"
-}
+def run_phased_migration(project_path, source_version, target_version, verbose=True):
+    # Run inventory once in Python — no agent needed
+    inventory = run_inventory(project_path)
+    inventory_context = inventory_to_prompt(inventory)
 
-def run_phased_migration(project_path, source_version, target_version, verbose):
     for phase in range(1, len(PHASE_NAMES) + 1):
         print(f"\n{'='*60}\n  PHASE {phase}\n{'='*60}")
         
+        initial_message = build_initial_message(project_path, source_version, target_version)
+
+        system_prompt = build_system_prompt(
+            source_version, target_version, project_path,
+            phase=phase,
+            inventory_context=inventory_context
+        )
+
         completed = run_agent(
-            project_path=project_path,
-            source_version=source_version,
-            target_version=target_version,
-            verbose=verbose,
-            phase=phase
+            system_prompt=system_prompt,
+            initial_message = initial_message,
+            verbose=verbose
         )
         
         if completed:
@@ -42,26 +45,17 @@ def run_phased_migration(project_path, source_version, target_version, verbose):
             print(f"   Fix manually then rerun from phase {phase}.")
             break
 
-def run_agent(project_path: str, source_version: str, target_version: str, verbose: bool = True, phase=1):
+def run_agent(system_prompt: str, initial_message: str, verbose: bool = True):
     """
     Main agent loop. Runs until Claude decides the migration is done
     or the max iteration limit is hit.
     """
     client = anthropic.Anthropic(max_retries=10)  # reads ANTHROPIC_API_KEY from environment
 
-    system_prompt = build_system_prompt(source_version, target_version, project_path)
-    initial_message = build_initial_message(project_path, source_version, target_version)
-
     # Conversation history — grows with each turn
     messages: list[MessageParam] = [
         {"role": "user", "content": initial_message}
     ]
-
-    print(f"\n{'='*60}")
-    print(f"  .NET Migration Agent")
-    print(f"  {source_version} → {target_version}")
-    print(f"  Project: {project_path}")
-    print(f"{'='*60}\n")
 
     for iteration in range(1, 16): 
         iteration += 1
