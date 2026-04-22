@@ -8,7 +8,7 @@ import subprocess
 import anthropic
 from anthropic.types import MessageParam
 from tools import TOOL_DEFINITIONS, execute_tool
-from prompts import build_system_prompt, build_initial_message, PHASE_NAMES
+from prompts import build_system_prompt, build_initial_message, PHASE_NAMES, resolve_package_versions
 import time
 from inventory import run_inventory, inventory_to_prompt
 
@@ -16,6 +16,12 @@ def run_phased_migration(project_path, source_version, target_version, verbose=T
     # Run inventory once in Python — no agent needed
     inventory = run_inventory(project_path)
     inventory_context = inventory_to_prompt(inventory)
+
+
+    # Resolve package versions before phase 1
+    csproj_files = list(inventory["csproj_files"].keys())
+    print("🔍 Pre-resolving NuGet package versions...")
+    resolved_versions = resolve_package_versions(csproj_files)
 
     for phase in range(1, len(PHASE_NAMES) + 1):
         print(f"\n{'='*60}\n  PHASE {phase}\n{'='*60}")
@@ -25,7 +31,8 @@ def run_phased_migration(project_path, source_version, target_version, verbose=T
         system_prompt = build_system_prompt(
             source_version, target_version, project_path,
             phase=phase,
-            inventory_context=inventory_context
+            inventory_context=inventory_context,
+            resolved_versions=resolved_versions
         )
 
         completed = run_agent(

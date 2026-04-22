@@ -4,6 +4,9 @@ This is where you define what the agent knows and how it should behave.
 The quality of this directly impacts migration quality.
 """
 
+import subprocess
+import json
+
 def _hard_rules() -> str:
     return """
 ## HARD RULES (never break these)
@@ -150,6 +153,33 @@ def build_initial_message(project_path: str, source_version: str,
 Project: {project_path}
 {source_version} → {target_version}
 """
+
+def resolve_package_versions(csproj_files: list[str]) -> dict[str, str]:
+    """Query NuGet for latest stable versions before agent starts."""
+    packages = set()
+    
+    # Extract all package names from csproj files
+    for csproj in csproj_files:
+        with open(csproj) as f:
+            content = f.read()
+        import re
+        found = re.findall(r'PackageReference Include="([^"]+)"', content)
+        packages.update(found)
+    
+    versions = {}
+    for pkg in packages:
+        result = subprocess.run(
+            f'dotnet package search "{pkg}" --take 1 --format json',
+            shell=True, capture_output=True, text=True
+        )
+        try:
+            data = json.loads(result.stdout)
+            latest = data["searchResult"][0]["packages"][0]["latestVersion"]
+            versions[pkg] = latest
+        except Exception:
+            versions[pkg] = "NOT_FOUND"
+    
+    return versions
 
 # def build_system_prompt(source_version, target_version, project_path):
 #     return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
