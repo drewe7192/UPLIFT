@@ -130,6 +130,13 @@ def read_file(path: str) -> str:
     except Exception as e:
         return f"ERROR: {e}"
 
+def read_multiple_files(paths: list[str]) -> str:
+    results = []
+    for path in paths:
+        content = read_file(path)
+        results.append(f"=== {path} ===\n{content}")
+    return "\n\n".join(results)
+
 
 def write_file(path: str, content: str) -> str:
     try:
@@ -236,16 +243,11 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         )
     elif tool_name == "run_command":
         return run_command(tool_input["command"], tool_input["working_directory"])
+    elif tool_name == "read_multiple_files":
+        return read_multiple_files(tool_input["paths"])
     else:
         return f"ERROR: Unknown tool '{tool_name}'"
     
-def read_multiple_files(paths: list[str]) -> str:
-    results = []
-    for path in paths:
-        content = read_file(path)
-        results.append(f"=== {path} ===\n{content}")
-    return "\n\n".join(results)
-
 def find_type_in_package(package_name: str, search_term: str = None) -> str:
     try:
         # Find the package in the NuGet cache
