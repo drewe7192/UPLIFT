@@ -50,6 +50,7 @@ def run_inventory(project_path: str) -> dict:
         if matches:
             with open(matches[0]) as f:
                 inventory[filename] = f.read()
+            inventory[f"{filename}_path"] = matches[0]
     
     return inventory
 
@@ -74,9 +75,39 @@ def inventory_to_prompt(inventory: dict) -> str:
     for path, content in inventory["csproj_files"].items():
         lines.append(f"\n**{path}:**\n```xml\n{content}\n```")
 
-    if "Program.cs" in inventory:
-        lines.append(f"\n### Program.cs\n```csharp\n{inventory['Program.cs']}\n```")
     if "Startup.cs" in inventory:
-        lines.append(f"\n### Startup.cs\n```csharp\n{inventory['Startup.cs']}\n```")
+        lines.append(f"\n### Startup.cs ({inventory['Startup.cs_path']})")
+        lines.append(f"```csharp\n{inventory['Startup.cs']}\n```")
+
+    if "Program.cs" in inventory:
+        lines.append(f"\n### Program.cs ({inventory['Program.cs_path']})")
+        lines.append(f"```csharp\n{inventory['Program.cs']}\n```")
 
     return "\n".join(lines)
+
+def run_test_inventory(project_path: str, max_chars: int = 3000) -> str:
+    """Run tests once and return structured failures. Free — no agent needed."""
+    result = subprocess.run(
+        "dotnet test --logger \"trx;LogFileName=/tmp/uplift_results.trx\"",
+        shell=True, cwd=project_path,
+        capture_output=True, text=True, timeout=300
+    )
+    
+    if result.returncode == 0:
+        return "All tests passing."
+    
+    try:
+        with open("/tmp/uplift_results.trx") as f:
+            content = f.read()
+        import re
+        failures = re.findall(
+            r'testName="([^"]+)"[^>]*outcome="Failed".*?<Message>(.*?)</Message>',
+            content, re.DOTALL
+        )
+        lines = [f"FAILED: {name}\n  {msg.strip()[:200]}" 
+                 for name, msg in failures]
+        output = f"{len(failures)} test failures:\n\n" + "\n\n".join(lines)
+    except Exception:
+        output = result.stdout[-3000:] + result.stderr[-1000:]
+
+    return output[:max_chars]

@@ -36,11 +36,18 @@ def _format_versions(resolved_versions: dict | None) -> str:
 
 
 def _phase_1_prompt(source_version, target_version, project_path,
-                    inventory_context=None, resolved_versions=None) -> str:
+                    inventory_context=None, resolved_versions=None, test_failures=None) -> str:
     return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
 Project: {project_path}
 
 {_hard_rules()}
+
+##
+IMPORTANT: If dotnet build fails with CS0234 (namespace not found) or CS1061 
+(method not found) errors, these are SOURCE FILE errors not package errors.
+Do not try to fix them by changing package versions.
+Instead: say PHASE COMPLETE — these will be fixed in phase 3.
+Only treat NU#### restore errors as package errors you must fix.
 
 {_format_inventory(inventory_context)}
 
@@ -60,7 +67,7 @@ When build is green and committed, say: PHASE COMPLETE
 
 
 def _phase_2_prompt(source_version, target_version, project_path,
-                    inventory_context=None, resolved_versions=None) -> str:
+                    inventory_context=None, resolved_versions=None, test_failures=None) -> str:
     return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
 Project: {project_path}
 
@@ -69,54 +76,80 @@ Project: {project_path}
 {_format_inventory(inventory_context)}
 
 ## YOUR ONLY GOAL: STARTUP MODERNIZATION
-Packages are already updated and build is green. Only touch Program.cs and Startup.cs.
+Startup.cs and Program.cs are in the inventory above — do not read them again.
 
-1. Startup.cs and Program.cs are already in the inventory above — do not re-read them
-2. Merge Startup.cs into Program.cs using WebApplication.CreateBuilder() pattern
-3. Account for every service registration from Startup.cs — none can be dropped
-4. Run `dotnet build` — fix errors
-5. Commit: `git add -A && git commit -m "migration: startup_modernization"`
+IMPORTANT: Write Program.cs in ONE complete write_file call.
+Do NOT use replace_in_file for this phase — it causes too many round trips.
+
+Steps:
+1. Study Startup.cs and Program.cs from the inventory above
+2. Write the complete merged Program.cs in a single write_file call that includes:
+   - WebApplication.CreateBuilder() pattern
+   - Every service registration from Startup.cs (ConfigureServices)
+   - Every middleware from Startup.cs (Configure)
+   - Remove Startup.cs reference from Program.cs
+3. Delete Startup.cs using: run_command with `rm {{startup_path}}`
+4. Run `dotnet build` — fix any errors
+5. Commit when green
 
 When build is green and committed, say: PHASE COMPLETE
 """
 
-
 def _phase_3_prompt(source_version, target_version, project_path,
-                    inventory_context=None, resolved_versions=None) -> str:
-    return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
+                    inventory_context=None, resolved_versions=None,
+                    test_failures=None) -> str:
+    return f"""You are an expert .NET migration engineer. 
+Migrate {source_version} → {target_version}.
 Project: {project_path}
 
 {_hard_rules()}
 
 {_format_inventory(inventory_context)}
 
-## YOUR ONLY GOAL: SOURCE FILE FIXES
-Startup is modernized and build is green. Fix remaining .cs file errors only.
+## YOUR ONLY GOAL: MAKE THE BUILD GREEN
 
-The inventory above already shows which deprecated APIs were found and where.
-Do not re-run searches — go directly to fixing the files listed.
+The build currently has errors. Fix all of them. You have full authority to:
+- Add missing NuGet packages to any .csproj file
+- Replace deprecated APIs with their modern equivalents  
+- Rewrite files that need significant changes
+- Remove packages that are incompatible
+- Add explicit package references that .NET 10 no longer includes transitively
 
-1. Run `dotnet build` to get the current error list
-2. Fix each erroring file using the deprecated API locations from the inventory
-3. Run `dotnet build` after each file change — do not batch multiple files
-4. Commit: `git add -A && git commit -m "migration: source_updates"`
+Do not ask permission. Do not wait. Just fix everything until dotnet build succeeds with 0 errors.
 
-When build is green and committed, say: PHASE COMPLETE
+When build is green, commit and say: PHASE COMPLETE
 """
 
 
 def _phase_4_prompt(source_version, target_version, project_path,
-                    inventory_context=None, resolved_versions=None) -> str:
+                    inventory_context=None, resolved_versions=None,
+                    test_failures=None) -> str:
+
+    failures_section = f"""
+## PRE-RUN TEST FAILURES (already identified — do not re-run tests to find these)
+{test_failures}
+""" if test_failures else ""
+
     return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
 Project: {project_path}
 
 {_hard_rules()}
 
-## YOUR ONLY GOAL: TESTS
-All source files are updated and build is green. Run tests and fix failures.
+{failures_section}
 
-1. Run `dotnet test`
-2. Fix any failures
+## YOUR ONLY GOAL: FIX THESE SPECIFIC TEST FAILURES
+Go directly to the files involved. Do not run `dotnet test` to discover failures —
+they are listed above. Fix each one, then run `dotnet test` once at the end to verify.
+
+## HOW TO READ ERRORS
+If you need more detail on a specific failure, read the trx file directly:
+find . -name "results.trx" | xargs grep -A 10 "outcome=\\"Failed\\""
+
+Do NOT run dotnet test repeatedly to discover what's broken — use the pre-run list above.
+
+## STEPS
+1. Fix each failure listed above, file by file
+2. Run `dotnet test` once to verify all pass
 3. Commit: `git add -A && git commit -m "migration: tests_passing"`
 
 When all tests pass and changes are committed, say: PHASE COMPLETE
@@ -139,13 +172,15 @@ PHASE_NAMES = {
 def build_system_prompt(source_version: str, target_version: str,
                         project_path: str, phase: int = 1,
                         inventory_context: str | None = None,
-                        resolved_versions: dict | None = None) -> str:
+                        resolved_versions: dict | None = None,
+                        test_failures: str | None = None) -> str:
     fn = PHASE_PROMPTS.get(phase)
     if not fn:
         raise ValueError(f"Unknown phase {phase}. Must be 1-{len(PHASE_PROMPTS)}.")
     return fn(source_version, target_version, project_path,
               inventory_context=inventory_context,
-              resolved_versions=resolved_versions)
+              resolved_versions=resolved_versions,
+              test_failures=test_failures)
 
 
 def build_initial_message(project_path: str, source_version: str,
@@ -154,39 +189,3 @@ def build_initial_message(project_path: str, source_version: str,
 Project: {project_path}
 {source_version} → {target_version}
 """
-
-def resolve_package_versions(csproj_files: list[str]) -> dict[str, str]:
-    """Query NuGet for latest stable versions before agent starts."""
-    packages = set()
-    
-    # Extract all package names from csproj files
-    for csproj in csproj_files:
-        with open(csproj) as f:
-            content = f.read()
-        import re
-        found = re.findall(r'PackageReference Include="([^"]+)"', content)
-        packages.update(found)
-    
-    versions = {}
-    for pkg in sorted(packages):
-        # Use nuget API directly — more reliable than dotnet package search
-        result = subprocess.run(
-            f'curl -s "https://api.nuget.org/v3-flatcontainer/{pkg.lower()}/index.json"',
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        try:
-            data = json.loads(result.stdout)
-            all_versions = data.get("versions", [])
-            # Filter out pre-release versions
-            stable = [v for v in all_versions if not any(
-                x in v for x in ["-alpha", "-beta", "-preview", "-rc"]
-            )]
-            if stable:
-                versions[pkg] = stable[-1]  # latest stable
-                print(f"   ✅ {pkg}: {stable[-1]}")
-            else:
-                print(f"   ⚠️  {pkg}: no stable version found, skipping")
-        except Exception:
-            print(f"   ❌ {pkg}: failed to resolve, skipping")
-    
-    return versions

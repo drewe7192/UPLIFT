@@ -229,12 +229,14 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
     """Called by the agent loop when Claude requests a tool."""
     if tool_name == "list_directory":
         return list_directory(tool_input["path"])
-    elif tool_name == "read_file":
-        return read_file(tool_input["path"])
+    elif tool_name == "replace_in_file":
+        if "new_str" not in tool_input:
+            return "ERROR: replace_in_file requires 'new_str' parameter. Your response may have been truncated — try again with a shorter replacement string."
+        return replace_in_file(tool_input["path"], tool_input["old_str"], tool_input["new_str"])
     elif tool_name == "write_file":
         return write_file(tool_input["path"], tool_input["content"])
-    elif tool_name == "replace_in_file":
-        return replace_in_file(tool_input["path"], tool_input["old_str"], tool_input["new_str"])
+    elif tool_name == "read_file":                          # ← missing
+        return read_file(tool_input["path"])
     elif tool_name == "search_in_files":
         return search_in_files(
             tool_input["directory"],
@@ -245,49 +247,61 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         return run_command(tool_input["command"], tool_input["working_directory"])
     elif tool_name == "read_multiple_files":
         return read_multiple_files(tool_input["paths"])
+    elif tool_name == "find_type_in_package":
+        return find_type_in_package(
+            tool_input["package_name"],
+            tool_input.get("search_term")
+        )
     else:
         return f"ERROR: Unknown tool '{tool_name}'"
-    
+
+
 def find_type_in_package(package_name: str, search_term: str = None) -> str:
-    try:
-        # Find the package in the NuGet cache
+    import glob, tempfile, os
+    pattern = os.path.expanduser(
+        f"~/.nuget/packages/{package_name.lower()}/**/*.dll"
+    )
+    dlls = glob.glob(pattern, recursive=True)
+    if not dlls:
+        return f"Package '{package_name}' not found in NuGet cache. Run dotnet restore first."
+
+    dll = sorted(dlls)[-1]
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        csproj = f"""<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>  
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="{dll}" />
+  </ItemGroup>
+</Project>"""
+        program = f"""
+using System.Reflection;
+using System.Runtime.CompilerServices;
+
+var dll = Assembly.LoadFrom(@"{dll}");
+var term = "{search_term or ""}".ToLower();
+var methods = dll.GetTypes()
+    .Where(t => t.IsPublic)
+    .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Static))
+    .Where(m => m.IsDefined(typeof(ExtensionAttribute), false))
+    .Select(m => $"{{m.DeclaringType!.Name}}.{{m.Name}}")
+    .Where(s => string.IsNullOrEmpty(term) || s.ToLower().Contains(term))
+    .Distinct().OrderBy(s => s);
+foreach (var m in methods) Console.WriteLine(m);
+"""
+        with open(os.path.join(tmp_dir, "inspect.csproj"), "w") as f:
+            f.write(csproj)
+        with open(os.path.join(tmp_dir, "Program.cs"), "w") as f:
+            f.write(program)
+
         result = subprocess.run(
-            f'find ~/.nuget/packages/{package_name.lower()} -name "*.dll" | head -5',
-            shell=True, capture_output=True, text=True
+            "dotnet run",
+            shell=True, cwd=tmp_dir,
+            capture_output=True, text=True, timeout=30
         )
-        dlls = result.stdout.strip().splitlines()
-        if not dlls:
-            return f"Package '{package_name}' not found in NuGet cache. Run dotnet restore first."
-        
-        dll = dlls[0]
-        
-        # Use dotnet-script or reflection to list public methods
-        script = f"""
-            using System.Reflection;
-            var asm = Assembly.LoadFrom("{dll}");
-            var methods = asm.GetTypes()
-                .Where(t => t.IsPublic)
-                .SelectMany(t => t.GetMethods(BindingFlags.Public | BindingFlags.Static))
-                .Where(m => m.IsDefined(typeof(System.Runtime.CompilerServices.ExtensionAttribute), false))
-                .Select(m => $"{{m.DeclaringType?.Name}}.{{m.Name}}({{string.Join(\", \", m.GetParameters().Select(p => p.ParameterType.Name + \" \" + p.Name))}})")
-                {"".join([f'.Where(s => s.Contains("{search_term}", StringComparison.OrdinalIgnoreCase))' if search_term else ''])}
-                .Distinct()
-                .OrderBy(s => s);
-            foreach (var m in methods) Console.WriteLine(m);
-            """
-        # Write and run a temp csx script
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(suffix='.csx', mode='w', delete=False) as f:
-            f.write(script)
-            tmp = f.name
-        
-        result = subprocess.run(
-            f'dotnet script {tmp}',
-            shell=True, capture_output=True, text=True, timeout=30
-        )
-        os.unlink(tmp)
-        
         output = result.stdout.strip() or result.stderr.strip()
         return output[:3000] if output else "No extension methods found."
-    except Exception as e:
-        return f"ERROR: {e}"
