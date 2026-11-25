@@ -1,22 +1,28 @@
 """
-prompts.py — System prompt and migration rules given to Claude.
-This is where you define what the agent knows and how it should behave.
-The quality of this directly impacts migration quality.
+prompts.py — System prompt and migration rules given to the agent.
 """
 
-import subprocess
-import json
 
 def _hard_rules() -> str:
     return """
 ## HARD RULES (never break these)
-1. Never modify source .cs files until `dotnet build` succeeds on updated .csproj files.
-2. Run `dotnet build` after every change. Fix errors before proceeding.
-3. If `dotnet build` fails twice in a row on the same issue, STOP and tell the user exactly what's broken and why.
-4. Never guess NuGet versions — use the pre-resolved versions provided to you.
-5. When done, run `git add -A && git commit -m "migration: <phase_name>"` to save progress.
-6. When your goal is complete, say exactly: PHASE COMPLETE
+1. Never modify source .cs files during Phase 1 (`package_updates`).
+2. Run `dotnet build` after making changes to verify progress.
+3. Never guess NuGet versions — use the pre-resolved versions provided to you.
+4. When done, run `git add -A && git commit -m "migration: <phase_name>"` to save progress.
+5. When your goal is complete, say exactly: PHASE COMPLETE
 """
+
+
+def _known_breaking_changes() -> str:
+    return """
+## KNOWN BREAKING PACKAGE CHANGES (Apply immediately without guessing)
+- **Microsoft.OpenApi >= 2.0.0**: `Microsoft.OpenApi.Models` does NOT exist. Use `using Microsoft.OpenApi;` and `new OpenApiInfo {{ ... }}`. Never add `using Microsoft.OpenApi.Models;`.
+- **Minimal Hosting (`Startup.cs` -> `Program.cs`)**: Keep `public partial class Program {{ }}` at the bottom of `Program.cs`, and use `batch_replace_in_files` to replace `<Startup>` with `<Program>` across `tests/`.
+- **EF Core 3.x -> 6+**: Replace `.ForSqlServerUseSequenceHiLo(` with `.UseHiLo(` and `.ForSqlServerUseIdentityColumn(` with `.UseIdentityColumn(` across all `.cs` files using `batch_replace_in_files`.
+- **AutoMapper 12+**: Remove `AddAutoMapper(typeof(Startup))` if `Startup` was deleted; use `AddAutoMapper(typeof(Program).Assembly)`.
+"""
+
 
 def _format_inventory(inventory_context: str | None) -> str:
     if not inventory_context:
@@ -25,6 +31,7 @@ def _format_inventory(inventory_context: str | None) -> str:
 ## PROJECT INVENTORY (pre-computed — do not re-run these searches)
 {inventory_context}
 """
+
 
 def _format_versions(resolved_versions: dict | None) -> str:
     if not resolved_versions:
@@ -37,100 +44,105 @@ def _format_versions(resolved_versions: dict | None) -> str:
 
 def _phase_1_prompt(source_version, target_version, project_path,
                     inventory_context=None, resolved_versions=None, test_failures=None) -> str:
-    return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
+    return f"""You are a .NET migration agent. Migrate {source_version} -> {target_version}.
 Project: {project_path}
 
 {_hard_rules()}
 
-##
-IMPORTANT: If dotnet build fails with CS0234 (namespace not found) or CS1061 
-(method not found) errors, these are SOURCE FILE errors not package errors.
-Do not try to fix them by changing package versions.
-Instead: say PHASE COMPLETE — these will be fixed in phase 3.
-Only treat NU#### restore errors as package errors you must fix.
+## IMPORTANT
+If `dotnet build` fails with `CS####` compiler errors (such as `CS0234` or `CS1061`), these are SOURCE FILE errors, not package errors.
+Do NOT try to fix `CS####` errors in Phase 1. Commit `.csproj` changes and say `PHASE COMPLETE` so Phase 3 can fix them.
+Only treat `NU####` NuGet restore errors as package errors you must fix.
 
 {_format_inventory(inventory_context)}
 
 {_format_versions(resolved_versions)}
 
 ## YOUR ONLY GOAL: PACKAGE UPDATES
-Only touch .csproj files — no .cs files.
+Only touch `.csproj` files — no `.cs` files.
 
-1. Update TargetFramework to net10.0 in all projects
+1. Update `<TargetFramework>` to `{target_version}` in all `.csproj` files
 2. Apply the pre-resolved package versions above — do not search for versions yourself
-3. If a package has no version in the table, remove it from the .csproj entirely — do not research it
-4. Run `dotnet build` — fix any remaining package conflicts
+3. If a package is marked `REMOVE`, delete its `<PackageReference>` from the `.csproj`
+4. Run `dotnet build` — fix any `NU####` package restore conflicts
 5. Commit: `git add -A && git commit -m "migration: package_updates"`
 
-When build is green and committed, say: PHASE COMPLETE
+When `NU####` errors are gone and changes are committed, say: PHASE COMPLETE
 """
 
 
 def _phase_2_prompt(source_version, target_version, project_path,
                     inventory_context=None, resolved_versions=None, test_failures=None) -> str:
-    return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
+    return f"""You are a .NET migration agent. Migrate {source_version} -> {target_version}.
 Project: {project_path}
 
 {_hard_rules()}
+
+{_known_breaking_changes()}
 
 {_format_inventory(inventory_context)}
 
 ## YOUR ONLY GOAL: STARTUP MODERNIZATION
-Startup.cs and Program.cs are in the inventory above — do not read them again.
+`Startup.cs` and `Program.cs` are in the inventory above — do not read them again.
 
-IMPORTANT: Write Program.cs in ONE complete write_file call.
-Do NOT use replace_in_file for this phase — it causes too many round trips.
+IMPORTANT:
+- Write `Program.cs` in ONE complete `write_file` call. Do NOT use `replace_in_file` for `Program.cs`.
+- Do NOT fix EF Core, Infrastructure, or test errors in other projects during Phase 2 — Phase 3 handles all remaining compiler errors across the solution.
+- If the project does not have a `Startup.cs` file, skip straight to committing and saying `PHASE COMPLETE`.
 
 Steps:
-1. Study Startup.cs and Program.cs from the inventory above
-2. Write the complete merged Program.cs in a single write_file call that includes:
-   - WebApplication.CreateBuilder() pattern
-   - Every service registration from Startup.cs (ConfigureServices)
-   - Every middleware from Startup.cs (Configure)
-   - Remove Startup.cs reference from Program.cs
-3. Delete Startup.cs using: run_command with `rm {{startup_path}}`
-4. Run `dotnet build` — fix any errors
-5. Commit when green
+1. Study `Startup.cs` and `Program.cs` from the inventory above
+2. Write the complete merged `Program.cs` in a single `write_file` call that includes:
+   - `WebApplication.CreateBuilder(args)` pattern (top-level statements preferred; if using `public class Program`, make it `public partial class Program` and include `using System.Threading.Tasks;`)
+   - Every service registration from `Startup.ConfigureServices`
+   - Every middleware from `Startup.Configure`
+   - `public partial class Program {{ }}` at the bottom ONLY if using top-level statements
+3. Delete `Startup.cs` using `run_command` with `rm <path-to-Startup.cs>`
+4. Run `dotnet build <path-to-Web.csproj>` (NOT the `.sln` — ignore `Infrastructure` and `tests/` errors, Phase 3 fixes those)
+5. Commit: `git add -A && git commit -m "migration: startup_modernization"`
 
-When build is green and committed, say: PHASE COMPLETE
+Once `Program.cs` is updated, `Startup.cs` is removed, and changes are committed, say: PHASE COMPLETE
 """
+
 
 def _phase_3_prompt(source_version, target_version, project_path,
                     inventory_context=None, resolved_versions=None,
                     test_failures=None) -> str:
-    return f"""You are an expert .NET migration engineer. 
-Migrate {source_version} → {target_version}.
+    return f"""You are an expert .NET migration engineer.
+Migrate {source_version} -> {target_version}.
 Project: {project_path}
 
 {_hard_rules()}
 
+{_known_breaking_changes()}
+
 {_format_inventory(inventory_context)}
 
 ## YOUR ONLY GOAL: MAKE THE BUILD GREEN
+The solution currently has compilation errors. Fix all of them across `src/` and `tests/`.
+Use `batch_replace_in_files` whenever replacing the same deprecated API or class name (`<Startup>` -> `<Program>`, `ForSqlServerUseSequenceHiLo` -> `UseHiLo`, etc.) across multiple files.
 
-The build currently has errors. Fix all of them. You have full authority to:
-- Add missing NuGet packages to any .csproj file
-- Replace deprecated APIs with their modern equivalents  
+You have full authority to:
+- Add missing NuGet packages to any `.csproj` file
+- Replace deprecated APIs with their modern equivalents
 - Rewrite files that need significant changes
-- Remove packages that are incompatible
-- Add explicit package references that .NET 10 no longer includes transitively
+- Remove incompatible packages
 
-Do not ask permission. Do not wait. Just fix everything until dotnet build succeeds with 0 errors.
+Do not ask permission. Fix everything until `dotnet build` succeeds with 0 errors.
 
-When build is green, commit and say: PHASE COMPLETE
+When `dotnet build` is green, commit (`git add -A && git commit -m "migration: source_updates"`) and say: PHASE COMPLETE
 """
 
 
 def _phase_4_prompt(source_version, target_version, project_path,
                     inventory_context=None, resolved_versions=None,
                     test_failures=None) -> str:
-
     failures_section = f"""
 ## PRE-RUN TEST FAILURES (already identified — do not re-run tests to find these)
 {test_failures}
 """ if test_failures else ""
 
-    return f"""You are a .NET migration agent. Migrate {source_version} → {target_version}.
+    return f"""You are a .NET migration agent. Migrate {source_version} -> {target_version}.
 Project: {project_path}
 
 {_hard_rules()}
@@ -138,14 +150,11 @@ Project: {project_path}
 {failures_section}
 
 ## YOUR ONLY GOAL: FIX THESE SPECIFIC TEST FAILURES
-Go directly to the files involved. Do not run `dotnet test` to discover failures —
-they are listed above. Fix each one, then run `dotnet test` once at the end to verify.
+Go directly to the files involved. Do not run `dotnet test` to discover failures — they are listed above. Fix each one, then run `dotnet test` once at the end to verify.
 
 ## HOW TO READ ERRORS
 If you need more detail on a specific failure, read the trx file directly:
-find . -name "results.trx" | xargs grep -A 10 "outcome=\\"Failed\\""
-
-Do NOT run dotnet test repeatedly to discover what's broken — use the pre-run list above.
+`find . -name "results.trx" | xargs grep -A 10 "outcome=\\"Failed\\""`
 
 ## STEPS
 1. Fix each failure listed above, file by file
@@ -154,6 +163,7 @@ Do NOT run dotnet test repeatedly to discover what's broken — use the pre-run 
 
 When all tests pass and changes are committed, say: PHASE COMPLETE
 """
+
 
 PHASE_PROMPTS = {
     1: _phase_1_prompt,
@@ -168,6 +178,7 @@ PHASE_NAMES = {
     3: "source_updates",
     4: "tests"
 }
+
 
 def build_system_prompt(source_version: str, target_version: str,
                         project_path: str, phase: int = 1,
@@ -187,5 +198,5 @@ def build_initial_message(project_path: str, source_version: str,
                           target_version: str, phase: int = 1) -> str:
     return f"""Begin phase {phase} ({PHASE_NAMES[phase]}) of the migration.
 Project: {project_path}
-{source_version} → {target_version}
+{source_version} -> {target_version}
 """

@@ -5,107 +5,124 @@ Each function here corresponds to a tool definition sent to Claude.
 
 import os
 import subprocess
-from anthropic.types import ToolParam
+from openai.types.chat import ChatCompletionToolParam
+
 
 
 # ── Tool Definitions (sent to Claude so it knows what's available) ──────────
 
-TOOL_DEFINITIONS: list[ToolParam] = [
+TOOL_DEFINITIONS: list[ChatCompletionToolParam] = [
     {
-        "name": "list_directory",
-        "description": "List files and folders in a directory. Use this to explore the project structure.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Directory path to list"}
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the full contents of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read"}
+                },
+                "required": ["path"],
             },
-            "required": ["path"]
-        }
+        },
     },
     {
-        "name": "read_file",
-        "description": "Read the full contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to read"}
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write (or overwrite) a file with new content. Use for creating new files or completely rewriting small ones.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write"},
+                    "content": {"type": "string", "description": "Full file content to write"},
+                },
+                "required": ["path", "content"],
             },
-            "required": ["path"]
-        }
+        },
     },
     {
-        "name": "write_file",
-        "description": "Write (or overwrite) a file with new content. Use for creating new files or completely rewriting small ones.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to write"},
-                "content": {"type": "string", "description": "Full file content to write"}
+        "type": "function",
+        "function": {
+            "name": "replace_in_file",
+            "description": "Replace an exact string in a file with a new string. Preferred for surgical edits — less risky than rewriting the whole file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_str": {"type": "string", "description": "Exact string to find (must be unique in the file)"},
+                    "new_str": {"type": "string", "description": "String to replace it with"},
+                },
+                "required": ["path", "old_str", "new_str"],
             },
-            "required": ["path", "content"]
-        }
+        },
     },
     {
-        "name": "replace_in_file",
-        "description": "Replace an exact string in a file with a new string. Preferred for surgical edits — less risky than rewriting the whole file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to edit"},
-                "old_str": {"type": "string", "description": "Exact string to find (must be unique in the file)"},
-                "new_str": {"type": "string", "description": "String to replace it with"}
+        "type": "function",
+        "function": {
+            "name": "search_in_files",
+            "description": "Search for a pattern (string or regex) across all files in a directory. Useful for finding deprecated APIs or patterns that need updating.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string", "description": "Directory to search in"},
+                    "pattern": {"type": "string", "description": "String or regex pattern to search for"},
+                    "file_extension": {
+                        "type": "string",
+                        "description": "Only search files with this extension, e.g. '.cs' or '.csproj'. Optional.",
+                    },
+                },
+                "required": ["directory", "pattern"],
             },
-            "required": ["path", "old_str", "new_str"]
-        }
+        },
     },
     {
-        "name": "search_in_files",
-        "description": "Search for a pattern (string or regex) across all files in a directory. Useful for finding deprecated APIs or patterns that need updating.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "directory": {"type": "string", "description": "Directory to search in"},
-                "pattern": {"type": "string", "description": "String or regex pattern to search for"},
-                "file_extension": {"type": "string", "description": "Only search files with this extension, e.g. '.cs' or '.csproj'. Optional."}
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command (e.g. 'dotnet build', 'dotnet test'). Use this to verify changes compile and tests pass. Always returns last 100 lines. Never pipe or grep this output — filtering is done for you.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to run"},
+                    "working_directory": {"type": "string", "description": "Directory to run the command in"},
+                },
+                "required": ["command", "working_directory"],
             },
-            "required": ["directory", "pattern"]
-        }
+        },
     },
     {
-        "name": "run_command",
-        "description": "Run a shell command (e.g. 'dotnet build', 'dotnet test'). Use this to verify changes compile and tests pass. Always returns last 100 lines. Never pipe or grep this output — filtering is done for you.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Shell command to run"},
-                "working_directory": {"type": "string", "description": "Directory to run the command in"}
+        "type": "function",
+        "function": {
+            "name": "read_multiple_files",
+            "description": "Read several files at once. Use instead of multiple read_file calls when you need to inspect more than one file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["paths"],
             },
-            "required": ["command", "working_directory"]
-        }
+        },
     },
     {
-        "name": "read_multiple_files",
-        "description": "Read several files at once. Use instead of multiple read_file calls when you need to inspect more than one file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "paths": {"type": "array", "items": {"type": "string"}}
+        "type": "function",
+        "function": {
+            "name": "find_type_in_package",
+            "description": "List all public types and extension methods in an installed NuGet package. Use this before calling any method from a package you haven't used before, or when a method name is uncertain.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_name": {"type": "string", "description": "Package name e.g. 'Scalar.AspNetCore'"},
+                    "search_term": {
+                        "type": "string",
+                        "description": "Optional: filter results to types/methods containing this string",
+                    },
+                },
+                "required": ["package_name"],
             },
-            "required": ["paths"]
-        }
+        },
     },
-    {
-        "name": "find_type_in_package",
-        "description": "List all public types and extension methods in an installed NuGet package. Use this before calling any method from a package you haven't used before, or when a method name is uncertain.",
-        "input_schema": {
-            "type": "object", 
-            "properties": {
-                "package_name": {"type": "string", "description": "Package name e.g. 'Scalar.AspNetCore'"},
-                "search_term": {"type": "string", "description": "Optional: filter results to types/methods containing this string"}
-            },
-            "required": ["package_name"]
-        }
-    }
 ]
 
 
@@ -167,7 +184,7 @@ def replace_in_file(path: str, old_str: str, new_str: str) -> str:
         return f"ERROR: {e}"
 
 
-def search_in_files(directory: str, pattern: str, file_extension: str = None) -> str:
+def search_in_files(directory: str, pattern: str, file_extension: str | None = None) -> str:
     try:
         cmd = ["grep", "-rn", pattern, directory]
         if file_extension:
@@ -241,7 +258,8 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         return search_in_files(
             tool_input["directory"],
             tool_input["pattern"],
-            tool_input.get("file_extension")
+            tool_input.get("file_extension") or ""
+
         )
     elif tool_name == "run_command":
         return run_command(tool_input["command"], tool_input["working_directory"])
@@ -250,13 +268,13 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
     elif tool_name == "find_type_in_package":
         return find_type_in_package(
             tool_input["package_name"],
-            tool_input.get("search_term")
+            tool_input.get("search_term") or ""
         )
     else:
         return f"ERROR: Unknown tool '{tool_name}'"
 
 
-def find_type_in_package(package_name: str, search_term: str = None) -> str:
+def find_type_in_package(package_name: str, search_term: str | None = None) -> str:
     import glob, tempfile, os
     pattern = os.path.expanduser(
         f"~/.nuget/packages/{package_name.lower()}/**/*.dll"

@@ -1,58 +1,71 @@
+import gzip
+import json
 import re
+import urllib.request
 
-def apply_package_updates(csproj_files: list[str], resolved_versions: dict[str, str]) -> list[str]:
+
+def get_target_major(to_version: str) -> str | None:
+    match = re.search(r"(\d+)\.\d+", to_version)
+    return match.group(1) if match else None
+
+
+def apply_package_updates(
+    csproj_files: list[str],
+    resolved_versions: dict[str, str],
+    to_version: str = "net10.0",
+) -> list[str]:
     changed = []
-    
+
     for csproj_path in csproj_files:
         with open(csproj_path) as f:
             content = f.read()
-        
+
         original = content
-        
-        # Update TargetFramework
+
+        # Update TargetFramework dynamically
         content = re.sub(
-            r'<TargetFramework>.*?</TargetFramework>',
-            '<TargetFramework>net10.0</TargetFramework>',
-            content
+            r"<TargetFramework>.*?</TargetFramework>",
+            f"<TargetFramework>{to_version}</TargetFramework>",
+            content,
         )
-        
+
         for pkg, ver in resolved_versions.items():
             if ver == "REMOVE":
-                # Remove self-closing: <PackageReference Include="Pkg" Version="x" />
                 content = re.sub(
                     rf'\s*<PackageReference Include="{re.escape(pkg)}"[^/]*/>\n?',
                     "",
                     content,
-                    flags=re.IGNORECASE
+                    flags=re.IGNORECASE,
                 )
-                # Remove block form: <PackageReference ...>...</PackageReference>
                 content = re.sub(
                     rf'\s*<PackageReference Include="{re.escape(pkg)}".*?</PackageReference>\n?',
                     "",
                     content,
-                    flags=re.IGNORECASE | re.DOTALL
+                    flags=re.IGNORECASE | re.DOTALL,
                 )
             else:
                 content = re.sub(
                     rf'(<PackageReference Include="{re.escape(pkg)}"[^>]*Version=")[^"]*(")',
-                    rf'\g<1>{ver}\g<2>',
+                    rf"\g<1>{ver}\g<2>",
                     content,
-                    flags=re.IGNORECASE
+                    flags=re.IGNORECASE,
                 )
-        
+
         if content != original:
-            with open(csproj_path, 'w') as f:
+            with open(csproj_path, "w") as f:
                 f.write(content)
             changed.append(csproj_path)
             print(f"   ✅ Updated: {csproj_path}")
-    
+
     return changed
 
 
-# resolve compatible versions together, not independently
-def resolve_package_versions(csproj_files: list[str]) -> dict[str, str]:
-    import re, json, subprocess
+def resolve_package_versions(
+    csproj_files: list[str],
+    to_version: str = "net10.0",
+) -> dict[str, str]:
     packages = set()
+    target_major = get_target_major(to_version)
 
     for csproj in csproj_files:
         with open(csproj) as f:
@@ -66,51 +79,63 @@ def resolve_package_versions(csproj_files: list[str]) -> dict[str, str]:
         "FluentValidation": "11.11.0",
         "FluentValidation.AspNetCore": "11.3.1",
         "FluentValidation.DependencyInjectionExtensions": "11.11.0",
-        "Microsoft.AspNetCore.Authentication.JwtBearer": "10.0.7",
-        # MediatR 12+ merged DI extension in — this package must die
         "MediatR.Extensions.Microsoft.DependencyInjection": "REMOVE",
-        # Deprecated after .NET 7, no net8/9/10 release exists
         "Microsoft.AspNetCore.ApiAuthorization.IdentityServer": "6.0.27",
+        "Swashbuckle.AspNetCore": "6.9.0",
+        "Swashbuckle.AspNetCore.Swagger": "6.9.0",
+        "Swashbuckle.AspNetCore.SwaggerGen": "6.9.0",
+        "Swashbuckle.AspNetCore.SwaggerUI": "6.9.0",
+        "Swashbuckle.AspNetCore.Annotations": "6.9.0",
     }
 
-    # Packages known to NOT support net10.0 even in latest stable
     TFM_UNSUPPORTED = {
         "Microsoft.AspNetCore.ApiAuthorization.IdentityServer",
     }
 
+    # Packages whose major version must match the target .NET SDK major version
+    RUNTIME_ALIGNED_PREFIXES = (
+        "Microsoft.EntityFrameworkCore",
+        "Microsoft.AspNetCore",
+        "Microsoft.Extensions",
+        "Microsoft.VisualStudio.Web.CodeGeneration",
+    )
+
     def get_registration_entry(pkg: str, version: str) -> dict:
-        import urllib.request, gzip, json
         url = f"https://api.nuget.org/v3/registration5-gz-semver2/{pkg.lower()}/{version}.json"
         try:
             req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 raw = r.read()
-                if r.info().get("Content-Encoding") == "gzip" or raw[:2] == b'\x1f\x8b':
+                if r.info().get("Content-Encoding") == "gzip" or raw[:2] == b"\x1f\x8b":
                     raw = gzip.decompress(raw)
                 return json.loads(raw)
         except Exception:
             return {}
 
-    def supports_tfm(pkg: str, version: str, tfm: str = "net10.0") -> bool:
+    def supports_tfm(pkg: str, version: str, tfm: str) -> bool:
         if pkg in TFM_UNSUPPORTED:
             return False
         entry = get_registration_entry(pkg, version)
         dep_groups = entry.get("dependencyGroups", [])
         if not dep_groups:
-            return True  # no TFM restriction listed, assume compatible
-        supported = [
-            g.get("targetFramework", "").lower()
-            for g in dep_groups
-        ]
-        # net10.0 should match "net10.0", ".netcoreapp", "net5.0+" era wildcards, or empty
-        return any(
-            tfm in t or t in ("", "any", ".netcoreapp3.1")
-            or t.startswith("net1") or t.startswith("net9") or t.startswith("net8")
-            for t in supported
-        ) or not any(t for t in supported)  # all empty = universal
+            return True
+
+        supported = [g.get("targetFramework", "").lower() for g in dep_groups]
+        if not any(supported):
+            return True
+
+        # Only allow TFMs <= target_major (never allow net11.0 when targeting net10.0)
+        target_num = int(target_major) if target_major else 10
+        allowed_nets = {f"net{i}.0" for i in range(5, target_num + 1)}
+
+        for t in supported:
+            if t in ("", "any", ".netcoreapp3.1") or t.startswith("netstandard"):
+                return True
+            if tfm.lower() in t or t in allowed_nets:
+                return True
+        return False
 
     def resolve_one(pkg: str) -> str | None:
-        import urllib.request, json
         url = f"https://api.nuget.org/v3-flatcontainer/{pkg.lower()}/index.json"
         try:
             with urllib.request.urlopen(url, timeout=10) as r:
@@ -122,10 +147,18 @@ def resolve_package_versions(csproj_files: list[str]) -> dict[str, str]:
             v for v in data.get("versions", [])
             if not any(x in v for x in ["-alpha", "-beta", "-preview", "-rc"])
         ]
+
+        # Lock Microsoft/EF/AspNetCore packages to the target .NET major version
+        if target_major and pkg.startswith(RUNTIME_ALIGNED_PREFIXES):
+            matching = [v for v in stable if v.startswith(f"{target_major}.")]
+            if matching:
+                stable = matching
+
         for v in reversed(stable):
-            if supports_tfm(pkg, v):
+            if supports_tfm(pkg, v, to_version):
                 return v
         return stable[-1] if stable else None
+
     versions = {}
     for pkg in sorted(packages):
         override = COMPATIBILITY_OVERRIDES.get(pkg)
